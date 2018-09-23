@@ -5,12 +5,19 @@ import org.apache.spark.sql._
 import org.apache.log4j.{Level, Logger}
 import java.sql.{Date, Timestamp}
 
-import org.apache.spark.sql.functions.{avg, split, stddev_pop}
 
+import scala.collection.mutable._
+import net.liftweb.json._
+import net.liftweb.json.Serialization.write
+
+import org.apache.spark.sql.functions.{collect_list,rank, explode,col,avg, split, stddev_pop,udf}
+import org.apache.spark.sql.expressions.Window
 import scala.collection.mutable
 
-object df {
+case class Word(topic: String, count: Int) //We create a Word Object that will be used later to write the json file.
 
+object df {
+  //Creation of the object GdeltData that represent the Data we are going to exploit
   case class GdeltData (
     GKGRECORDID                 : String,
     DATE                        : Date,
@@ -40,9 +47,12 @@ object df {
     TranslationInfo             : String,
     Extras                      : String
   )
-
+  /* Main function : Compute the top 10 talked topics for each day
+  *  from the records of the GdeltData
+  */
   def main(args: Array[String]): Unit = {
 
+    // The schema is the header of the DataFrame we are going to create.
     val schema =
       StructType(
         Array(
@@ -75,6 +85,8 @@ object df {
           StructField("Extras"                      , StringType,     nullable = true)
         ))
 
+
+    //Starting the Spark Session
     Logger.getLogger("org.apache.spark").setLevel(Level.WARN)
 
     val spark = SparkSession
@@ -86,49 +98,48 @@ object df {
     import spark.implicits._
     val sc = spark.sparkContext
 
-    val filePath = "src/main/resources/20150218230000.gkg.csv"
-
-    val ds = spark.read
+    val filePath = "src/main/resources/*500.gkg.csv"
+    //Creating the Dataframe and importing the data from the resources files.
+    val df = spark.read
       .schema(schema)
       .option("delimiter", "\t")
       .option("dateFormat", "yyyyMMddHHmmss")
       .csv(filePath)
       .as[GdeltData]
 
-    case class DuplicateRemoved(DATE: String,
-                                products: mutable.WrappedArray[String],
-                                rm_duplicates: mutable.WrappedArray[String])
+    //USer-Defined Function used to Split a String of the form : String,num in order to keep only the String
+    val remove_udf = udf((p: String) => {
+      p.split(",")(0)
+    })
+    //Computations on the DataFrame
+    val dsPart = df.select("DATE", "AllNames")//Selecting the columns we need
+      .withColumn("_tmp", split($"AllNames", ";"))//Splitting the String present in AllNames, so we have an array
+      .drop("AllNames")//Deleting the old AllNames column
+      .withColumn("NamesS", explode($"_tmp"))//We explode the array that was created in order to have one record for each topic
+      .drop("_tmp")//Deleting intermediate column
+      .withColumn("Names", remove_udf($"NamesS"))//Using the remove udf function on the topics in order to delete the internal count
+      .drop("NamesS")
+      .groupBy("DATE","Names").count()//Group the records by Date and Name and count the frequency of each topic per day
+      .withColumn("rank", rank().over(Window.partitionBy("DATE").orderBy($"count".desc)))//Create a rank in order to sort the topic
+      .filter($"rank" <= 10)//Keep only the Top 10 topics per day
+      .drop("rank")//Deleting intermediate column
 
-    // Select the columns we need
-    val dsPart = ds.select("DATE", "AllNames")
-      .withColumn("_tmp", split($"AllNames", ";"))
-      .drop("AllNames")
-//      .map{case x =>
-//        (x, removeDuplicates(x(1).asInstanceOf(String)))}
-//        .toDF()
-//      .groupBy("DATE")
+    //Function used to append the topic name and his count into a json object
+    val zipper = udf((n: String, p: Int) => {
 
-    val namesDic = collection.mutable.Map[Date, collection.mutable.Map[String, Int]]()
+      implicit val formats = DefaultFormats
+      write(Word(n,p))
 
-//    dsPart.printSchema()
-    println()
+    })
 
+    //Creating the Json object for different days and writing it into a file
+    dsPart.withColumn("result", zipper($"Names",$"count")).drop("Names").drop("count")
+      .withColumnRenamed("DATE","date")
+      .groupBy("date").agg(collect_list("result").alias("result")).write.json("src/main/output")
 
 
-//    dsPart.collect.foreach(println)
-//    dsPart.show()
 
-
+    //Closing the spark Session
     spark.stop()
-  }
-
-  def removeDuplicates (names: Array[String]): Set[String] = {
-
-    val nameSet = collection.mutable.Set[String]()
-
-    for (name <- names) {
-      nameSet.add(name.split(",")(0))
-    }
-    nameSet.toSet
   }
 }

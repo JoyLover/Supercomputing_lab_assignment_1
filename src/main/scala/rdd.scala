@@ -29,30 +29,34 @@ object rdd {
     import spark.implicits._
     val sc = spark.sparkContext
 
-    val filePath = "src/main/resources/*500.gkg.csv"
+    val filePath = "src/main/resources/*.gkg.csv"
 
     val raw_data = sc.textFile(filePath)
 
-    val filterRDD = raw_data.map(_.split("\t", -1))
-        .filter(_.length > 23)
-        .map(x => (x(1), x(23)))
-        .map {
+    // Main steps.
+    val filterRDD = raw_data.map(_.split("\t", -1))   // Split the row to list of strings.
+        .filter(_.length > 23)  // Discard the row of which the length is less than 23 to avoid unexpected errors.
+        .map(x => (x(1), x(23)))  // Select the "DATE" and "AllNames" columns.
+        .map {    // Remove the duplicates in "AllNames" value within each record and change the Timestamp type to Date type.
           case (x, y) => (
             new Timestamp(new SimpleDateFormat("yyyyMMddHHmmss").parse(x).getTime).toString.split(" ")(0)
             , removeDuplicates(y))
         }
-        .flatMap {case (x, y) => flatMatch(x, y)}
-        .map {case (x, y, z) => ((x, y), z)}
-        .filter {case ((x, y), z) => y != ""}
-        .reduceByKey((x, y) => x + y)
-        .map {case ((x, y), z) => (x, (y, z))}
-        .sortBy(_._2._2, ascending = false)
-        .groupByKey()
+        // Flat the key-value pair to match key to every element in the value set. 
+        // The 1st entry is "DATE", the 2nd is "AllNames" and the 3rd is the number of occurances of each topic.
+        .flatMap {case (x, y) => flatMatch(x, y)} 
+        .map {case (x, y, z) => ((x, y), z)}    // Reconstruct the structure.
+        .filter {case ((x, y), z) => y != ""}   // Filter record with empty topic.
+        .reduceByKey((x, y) => x + y)           // Computer the number of occurances of each topic every event.
+        .map {case ((x, y), z) => (x, (y, z))}  // Reconstruct the structure.
+        .sortBy(_._2._2, ascending = false)     // Descend by number of occurances of each topic.
+        .groupByKey()                           // Group by "DATE".
 
-
+    // Used for json format.
     case class nameCount(topic: String, count: Int)
     case class Results(date: String, result: List[nameCount])
 
+    // Map every field to its name.
     val json =
       (
         (filterRDD.collect().toList.map{
@@ -66,8 +70,6 @@ object rdd {
         })
       )
 
-//    filterRDD.foreach(println)
-
     println()
 
     println(compact(render(json)))
@@ -80,6 +82,11 @@ object rdd {
     spark.stop()
   }
 
+  /**
+    * Remove duplicate topics
+    * @param names  Original topics (not yet split into list of topics)
+    * @return   Set containing all different topics
+    */
   def removeDuplicates (names: String): Set[String] = {
 
     val nameArray = names.split(";")
@@ -91,6 +98,13 @@ object rdd {
     nameSet.toSet
   }
 
+  /**
+    * Flat the key-value pair to match key to every element in the value set.
+    * The 1st entry is "DATE", the 2nd is "AllNames" and the 3rd is the number of occurances of each topic
+    * @param day  "DATE"
+    * @param nameSet  Set containing different topics in one event.
+    * @return   Set("DATE", "AllNames", Number)
+    */
   def flatMatch (day: String, nameSet: Set[String]): Set[Tuple3[String, String, Int]] = {
 
     val nameTuple = collection.mutable.Set[Tuple3[String, String, Int]]()
