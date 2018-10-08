@@ -1,1 +1,0 @@
-# Supercomputing_lab_assignment_1
